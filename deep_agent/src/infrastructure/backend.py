@@ -69,6 +69,113 @@ class ReadOnlyFilesystemBackend(FilesystemBackend):
         ]
 
 
+class DeduplicatingStoreBackend:
+    """Wrapper around StoreBackend that deduplicates memory content on write.
+
+    Intercepts write/edit calls to memory files and removes near-duplicate
+    lines before persisting. All other operations are proxied unchanged.
+    """
+
+    def __init__(self, inner: Any, memory_prefix: str = "/memories/") -> None:
+        """Wrap *inner* backend, deduplicating writes under *memory_prefix*."""
+        self._inner = inner
+        self._memory_prefix = memory_prefix
+
+    def _deduplicate_content(self, content: str) -> str:
+        """Remove near-duplicate lines from memory file content."""
+        import re
+
+        from deep_agent.src.memory.clustering import cluster_memories
+
+        lines = content.strip().split("\n")
+        facts: list[str] = []
+        non_fact_lines: list[str] = []
+
+        for line in lines:
+            cleaned = re.sub(r"^[-*•]\s*", "", line).strip()
+            if cleaned:
+                facts.append(cleaned)
+            elif line.strip():
+                non_fact_lines.append(line)
+
+        if len(facts) < 2:
+            return content
+
+        clusters = cluster_memories(facts)
+        indices_to_remove: set[int] = set()
+        for group in clusters:
+            longest_idx = max(group, key=lambda i: len(facts[i]))
+            for idx in group:
+                if idx != longest_idx:
+                    indices_to_remove.add(idx)
+
+        if not indices_to_remove:
+            return content
+
+        deduped_facts = [f for i, f in enumerate(facts) if i not in indices_to_remove]
+        result_lines = non_fact_lines + [f"- {f}" for f in deduped_facts]
+        logger.debug(
+            "Deduplicated memory: %d facts → %d (removed %d)",
+            len(facts),
+            len(deduped_facts),
+            len(indices_to_remove),
+        )
+        return "\n".join(result_lines) + "\n"
+
+    def _is_memory_path(self, file_path: str) -> bool:
+        return file_path.startswith(self._memory_prefix)
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        """Write *content* to *file_path*, deduplicating memory files."""
+        if self._is_memory_path(file_path):
+            content = self._deduplicate_content(content)
+        return self._inner.write(file_path, content)
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        """Async write with memory deduplication."""
+        if self._is_memory_path(file_path):
+            content = self._deduplicate_content(content)
+        return await self._inner.awrite(file_path, content)
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,  # noqa: FBT001, FBT002
+    ) -> EditResult:
+        """Edit file, then deduplicate if it is a memory file."""
+        result = self._inner.edit(file_path, old_string, new_string, replace_all)
+        if self._is_memory_path(file_path) and not getattr(result, "error", None):
+            current = self._inner.read(file_path)
+            if current:
+                deduped = self._deduplicate_content(current)
+                if deduped != current:
+                    self._inner.write(file_path, deduped)
+        return result
+
+    async def aedit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,  # noqa: FBT001, FBT002
+    ) -> EditResult:
+        """Async edit with memory deduplication."""
+        result = await self._inner.aedit(file_path, old_string, new_string, replace_all)
+        if self._is_memory_path(file_path) and not getattr(result, "error", None):
+            current = await self._inner.aread(file_path)
+            if current:
+                deduped = self._deduplicate_content(current)
+                if deduped != current:
+                    await self._inner.awrite(file_path, deduped)
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        """Proxy all other methods to the inner backend."""
+        return getattr(self._inner, name)
+
+
 def _base_python() -> str:
     """Resolve the base (non-venv) Python so the agent venv is independent.
 
@@ -437,7 +544,12 @@ def _build_composite_backend(fs_config: Any) -> Any:
                 )
                 store_backend = StoreBackend(runtime, namespace=ns)
                 for prefix in store_route_prefixes:
-                    routes[prefix] = store_backend
+                    if prefix.rstrip("/").endswith("memories"):
+                        routes[prefix] = DeduplicatingStoreBackend(
+                            store_backend, memory_prefix=prefix
+                        )
+                    else:
+                        routes[prefix] = store_backend
             except ImportError:
                 logger.warning(
                     "StoreBackend not available — store routes will use StateBackend"
